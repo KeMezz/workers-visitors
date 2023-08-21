@@ -24,6 +24,7 @@ export interface Env {
 
 // @ts-ignore
 import home from "./home.html";
+import { makeBadge } from "./utils";
 
 function handleHome() {
   return new Response(home, {
@@ -43,13 +44,12 @@ async function handleVisit(searchParams: URLSearchParams, env: Env) {
   let value = 1;
   if (!kvPage) {
     await env.view_counter.put(page, value + "");
-    // return new Response(value+"", { status: 201 });
   } else {
     value = parseInt(kvPage) + 1;
     await env.view_counter.put(page, value + "");
   }
-  return new Response(JSON.stringify({ visits: value }), {
-    headers: { "Content-Type": "application/json" },
+  return new Response(makeBadge(value), {
+    headers: { "Content-Type": "image/svg+xml;chartset=utf-8" },
   });
 }
 
@@ -68,7 +68,6 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
-    console.log(searchParams);
     switch (pathname) {
       case "/":
         return handleHome();
