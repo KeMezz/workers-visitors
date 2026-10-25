@@ -1,64 +1,114 @@
 /**
- * Welcome to Cloudflare Workers! This is your first worker.
+ * Cloudflare Worker: Visitor Counter
  *
- * - Run `wrangler dev src/index.ts` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `wrangler publish src/index.ts --name my-worker` to publish your worker
- *
- * Learn more at https://developers.cloudflare.com/workers/
+ * Provides a public visitor counter badge backed by Cloudflare KV.
+ * Input validation, page restrictions, and rate limiting protect against abuse and KV quota exhaustion.
  */
 
 export interface Env {
-  // Example binding to KV. Learn more at https://developers.cloudflare.com/workers/runtime-apis/kv/
+  // Binding to Cloudflare KV for visitor counters
   view_counter: KVNamespace;
-  //
-  // Example binding to Durable Object. Learn more at https://developers.cloudflare.com/workers/runtime-apis/durable-objects/
-  // MY_DURABLE_OBJECT: DurableObjectNamespace;
-  //
-  // Example binding to R2. Learn more at https://developers.cloudflare.com/workers/runtime-apis/r2/
-  // MY_BUCKET: R2Bucket;
-  //
-  // Example binding to a Service. Learn more at https://developers.cloudflare.com/workers/runtime-apis/service-bindings/
-  // MY_SERVICE: Fetcher;
+  // Optional comma-separated list of allowed page identifiers, full URLs, or wildcard domains (*.example.com)
+  ALLOWED_PAGES?: string;
 }
 
 // @ts-ignore
 import home from "./home.html";
 import { makeBadge } from "./utils";
+import {
+  RateLimitEntry,
+  checkRateLimit,
+  isValidPageKey,
+  isAllowedPage,
+} from "./validator";
 
-function handleHome() {
+// In-memory rate limiting structures.
+// NOTE: This runs in-memory per Cloudflare Worker isolate.
+// Cloudflare Workers execute across hundreds of edge locations; hence this state is not globally durable
+// or synchronized across isolates. However, it effectively prevents high-frequency burst abuse,
+// denial-of-wallet, and KV write exhaustion within individual active isolates without requiring
+// external centralized synchronization.
+const ipLimits = new Map<string, RateLimitEntry>();
+const pageLimits = new Map<string, RateLimitEntry>();
+
+function handleHome(): Response {
   return new Response(home, {
     headers: {
-      "Content-Type": "text/html;chartset=utf-8",
+      "Content-Type": "text/html; charset=utf-8",
     },
   });
 }
 
-async function handleVisit(searchParams: URLSearchParams, env: Env) {
+export async function handleVisit(
+  searchParams: URLSearchParams,
+  env: Env,
+  clientIp: string = "unknown"
+): Promise<Response> {
   const page = searchParams.get("page");
-  if (!page) {
-    return handleBadRequest();
+  if (!isValidPageKey(page)) {
+    return handleBadRequest("Invalid page parameter. Must be non-empty, <= 256 characters, and contain safe characters.");
   }
 
-  const kvPage = await env.view_counter.get(page);
-  let value = 1;
-  if (!kvPage) {
-    await env.view_counter.put(page, value + "");
-  } else {
-    value = parseInt(kvPage) + 1;
-    await env.view_counter.put(page, value + "");
+  const validPage = page!.trim();
+
+  if (!isAllowedPage(validPage, env.ALLOWED_PAGES)) {
+    return new Response("Forbidden: Page is not authorized.", {
+      status: 403,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
   }
+
+  // Rate limit: 60 requests per 60 seconds per IP
+  const isIpAllowed = checkRateLimit(clientIp, ipLimits, 60, 60_000);
+  // Rate limit: 20 writes per 10 seconds per page key
+  const isPageAllowed = checkRateLimit(validPage, pageLimits, 20, 10_000);
+
+  if (!isIpAllowed || !isPageAllowed) {
+    return new Response("Too Many Requests", {
+      status: 429,
+      headers: {
+        "Retry-After": "10",
+        "Content-Type": "text/plain; charset=utf-8",
+      },
+    });
+  }
+
+  let value = 1;
+  try {
+    const kvPage = await env.view_counter.get(validPage);
+    if (kvPage) {
+      const parsed = parseInt(kvPage, 10);
+      value = Number.isFinite(parsed) && parsed >= 0 ? parsed + 1 : 1;
+    }
+    await env.view_counter.put(validPage, value.toString());
+  } catch (err) {
+    console.error("KV operation error:", err);
+    return new Response("Internal Storage Error", {
+      status: 500,
+      headers: { "Content-Type": "text/plain; charset=utf-8" },
+    });
+  }
+
   return new Response(makeBadge(value), {
-    headers: { "Content-Type": "image/svg+xml;chartset=utf-8" },
+    headers: {
+      "Content-Type": "image/svg+xml; charset=utf-8",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+    },
   });
 }
 
-function handleBadRequest() {
-  return new Response(null, { status: 400 });
+function handleBadRequest(message: string = "Bad Request"): Response {
+  return new Response(message, {
+    status: 400,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
 }
 
-function handleNotFound() {
-  return new Response(null, { status: 404 });
+function handleNotFound(): Response {
+  return new Response("Not Found", {
+    status: 404,
+    headers: { "Content-Type": "text/plain; charset=utf-8" },
+  });
 }
 
 export default {
@@ -68,11 +118,12 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
+    const clientIp = request.headers.get("cf-connecting-ip") || "unknown";
     switch (pathname) {
       case "/":
         return handleHome();
       case "/visit":
-        return handleVisit(searchParams, env);
+        return handleVisit(searchParams, env, clientIp);
       default:
         return handleNotFound();
     }
